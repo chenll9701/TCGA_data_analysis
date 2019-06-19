@@ -1,0 +1,407 @@
+# The code for get and process TCGA data 
+library('XML')
+library('methods')
+library('stringr')
+library('dplyr')
+library('org.Hs.eg.db')
+library('data.table')
+library('ggpubr')
+library('DESeq2')
+library('edgeR')
+library('clusterProfiler')
+library('ReactomePA')
+library('RTCGA')
+library('RTCGA.mutations')
+library('RTCGA.clinical')
+library('RTCGA.rnaseq')
+library('RTCGA.mRNA')
+library('statmod')
+(.packages()) ## to look at the loaded packages
+## to get clinical information 
+dir='~/tcga/PRAD/clinical'
+PRAD_clinical <- lapply(list.files(path=dir, pattern='*.xml$', recursive=T),
+	function(x) {
+	##library('XML')
+	##library('methods')
+	result <- xmlParse(file=file.path(dir,x))
+	##print(results)
+	##str(results)
+	## extract the root node from the xml file
+	rootnode <- xmlRoot(result)
+	## find number of nodes in the root 
+	##rootsize <- xmlSize(rootnode)
+	## print the results
+	##print(rootsize)
+	## print the results
+	##print(rootnode[1])
+	## convert the input xml file to a data frame
+	xmlDataFrame <- xmlToDataFrame(rootnode[2])
+	##dim(xmlDataFrame)
+	return(t(xmlDataFrame))
+	})
+df <- t(do.call(cbind, PRAD_clinical))	
+write.table(df, paste(dir,'/','TCGA_PRAD_clinical.tsv',sep=''),sep='\t', row.names=F)
+clinical_info=as_tibble(read.table(file.path(dir, 'TCGA_PRAD_clinical.tsv'),sep='\t', header=T)) %>%
+		dplyr::select(tumor_tissue_site, gender, vital_status, days_to_last_followup, race_list, bcr_patient_barcode, patient_id, 
+			age_at_initial_pathologic_diagnosis, year_of_initial_pathologic_diagnosis, person_neoplasm_cancer_status, 
+			histological_type, stage_event) %>%
+		dplyr::rename( race=race_list, age=age_at_initial_pathologic_diagnosis, year=year_of_initial_pathologic_diagnosis,
+						cancer_status=person_neoplasm_cancer_status) -> PRAD_clinical
+save(clinical_info, file=file.path(dir,'PRAD_clinical.Rdata'))
+
+
+## to get gene expreesion dataset
+dir2='~/tcga/PRAD/rnaseq'	
+rnaseq <- lapply(list.files(path=dir2, pattern='*.htseq.counts.gz$', recursive=T),
+		function (x) {
+		result <- read.table(gzfile(file.path(dir2, x)), sep='\t', header=F)
+		colnames(result) <- c('gene','counts')
+		id <- str_split(x, pattern='/')
+		id_name <- id[[1]][2]
+		result$file_id <- id_name
+		return(result)
+		})
+rnaseq_df <- t(do.call(cbind, rnaseq))
+colnames(rnaseq_df) <- rnaseq_df[1,]
+file_id=rnaseq_df[seq(3,nrow(rnaseq_df), by=3),1]
+rnaseq_df=rnaseq_df[seq(2,nrow(rnaseq_df), by=3),]
+rownames(rnaseq_df) <- file_id
+### to convert ENSEMBL gene to gene symbol
+ensembl <- colnames(rnaseq_df)			
+str_gene <- function(x) {
+	gene <- str_split(x, pattern='[.]')
+	gene <- gene[[1]][1]
+	return(gene)
+	}
+ensembl <- unlist(lapply(ensembl, FUN=str_gene))
+k=keys(org.Hs.eg.db,keytype = "ENSEMBL")
+list=AnnotationDbi::select(org.Hs.eg.db,keys=k,columns = "SYMBOL", keytype="ENSEMBL")
+ensembl <- list[match(ensembl,list[,"ENSEMBL"]),]
+symbol <- ensembl$SYMBOL
+colnames(rnaseq_df) <- symbol
+### END ###
+rnaseq_df=rnaseq_df[,!is.na(colnames(rnaseq_df))] %>%
+		as_tibble() %>%
+		dplyr::mutate(id=file_id) ->  rnaseq_df
+sample_id=fread(file.path(dir2,'gdc_sample_sheet.tsv'), sep='\t', header=T) %>%
+		dplyr::select('File Name', 'Sample ID', 'Sample Type') %>%
+		dplyr::rename(file_name='File Name', sample_id='Sample ID', sample_type='Sample Type') %>%
+		as_tibble() -> sample_info
+rnaseq.sample=merge(rnaseq_df, sample_info, by.x='id', by.y='file_name')
+sample_id=rnaseq.sample[,(ncol(rnaseq.sample)-1):ncol(rnaseq.sample)]
+rnaseq.sample=rnaseq.sample[,2:(ncol(rnaseq.sample)-2)]
+rnaseq.sample=cbind(sample_id, rnaseq.sample)
+write.csv(rnaseq.sample, file.path(dir2,'rnaseq.sample.tsv'), sep='\t', row.names=F)
+data=fread(file.path(dir2, 'rnaseq.sample.tsv'))
+sample_id=data$sample_id
+sample_id=gsub(pattern='-', replacement='_', x=sample_id)
+gene=colnames(data)[-(1:2)]
+expr=t(data[,3:ncol(data)]) ### In DESeq2, row means gene and column means sample
+expr=as.data.frame(expr, stringsAsFactors=F)
+colnames(expr) <- sample_id
+rownames(expr) <- gene
+exprSet=as.data.frame(lapply(expr,as.numeric))
+rownames(exprSet) <- gene
+save(exprSet, file=file.path(dir2, 'PRAD_exprSet.Rdata'))
+
+## to get mutation information
+## to deal with mutation data
+dir3='~/tcga/PRAD/mutation/1e36e3a8-548e-4188-8915-d0e6172f01da'
+data=read.csv(file=file.path(dir3,'PRAD_mutation.maf'), header = TRUE, sep = '\t', stringsAsFactors = FALSE, comment.char = "#") %>%
+		dplyr::select('Hugo_Symbol','Entrez_Gene_Id','NCBI_Build','Chromosome','Start_Position','End_Position',
+					'Strand','Variant_Classification','Variant_Type','Reference_Allele','Tumor_Seq_Allele1',
+					'Tumor_Seq_Allele2','dbSNP_RS','Tumor_Sample_Barcode','Matched_Norm_Sample_Barcode','Protein_position',
+					'Amino_acids','BIOTYPE','SIFT','PolyPhen') -> PRAD_mutation
+save(PRAD_mutation, file='~/tcga/PRAD/mutation/PRAD_mutation.Rdata')
+
+## to match sample information with tissue information 
+dir='~/tcga/PRAD/clinical'
+dir2='~/tcga/PRAD/rnaseq'
+dir3='~/tcga/PRAD/mutation'	
+load(file.path(dir, 'PRAD_clinical.Rdata'))
+load(file.path(dir2, 'PRAD_exprSet.Rdata'))
+load(file.path(dir3, 'PRAD_mutation.Rdata'))
+clinical_info <- dplyr::select(clinical_info, bcr_patient_barcode, race, age, gender)
+clinical_info$bcr_patient_barcode=gsub(pattern='-', replacement='_', clinical_info$bcr_patient_barcode) 
+tissue=colnames(exprSet)
+tissue_id=data.frame(tissue_id=tissue)
+case=filter(tissue_id, as.numeric(substr(tissue_id, 14, 15)) < 10)
+case$type='case'
+control=filter(tissue_id, substr(tissue_id, 14, 15) == '11')
+control$type='control'
+tissue_info=rbind(case,control)
+tissue_info=mutate(tissue_info, bcr_patient_barcode=substr(tissue_id, 1, 12))
+merged_info=merge(tissue_info, clinical_info, by='bcr_patient_barcode')
+paired=table(merged_info$bcr_patient_barcode) %>%
+		as.data.frame() %>%
+		filter(Freq > 1) -> paired_sample
+colnames(paired_sample) <- c('bcr_patient_barcode', 'tissue_num')
+paired_info=merge(paired_sample,merged_info, by='bcr_patient_barcode')
+paired_info=paired_info[which(paired_info$tissue_id !='TCGA_HC_8258_01B'),]
+paired_info=paired_info[which(paired_info$tissue_id !='TCGA_HC_7740_01B'),]
+paired_info=paired_info[which(paired_info$bcr_patient_barcode !='TCGA_V1_A9O5'),]
+paired_info=paired_info[which(paired_info$bcr_patient_barcode !='TCGA_HC_8265'),]
+save(paired_info, file='paired_info.Rdata')
+
+### to combine mutation information with clinical information
+PRAD.clinical.mutation=left_join(merged_info, PRAD_mutation, by='tissue_id')
+PRAD.clinical.mutations=mutate(PRAD.clinical.mutations, 
+							TP53=ifelse(!is.na(Variant_Classification), 'Mut', 'WILDorNOINFO'))
+PRAD.2plot = select(PRAD.clinical.mutations, times, patient.vital_status, disease, TP53)
+tbale(PRAD.2plot$TP53)
+km_plot <- kmTCGA(PRAD.2plot, explanatory.names=c('TP53','disease'), break.time.by=400,
+					xlim=c(0,2000), pval=TRUE)
+merged_info=dplyr::select(merged_info, tissue_id, type, race, age, gender)
+merged_info$race=factor(merged_info$race)
+merged_info$age=factor(merged_info$age)
+merged_info$gender=factor(merged_info$gender)
+merged_info$type=factor(merged_info$type, levels=c('control','case'))
+exprSet=as.matrix(exprSet)
+
+
+
+## use edgeR
+### to construct the analysis matrix (overall)
+expr1=exprSet[,which(as.numeric(substr(colnames(exprSet), 14, 15))<10)]
+expr2=exprSet[,which(as.numeric(substr(colnames(exprSet), 14, 15))>10)]
+exprSet=cbind(expr1,expr2)
+group <- factor(c(rep('case',499), rep('control',52)))
+y <- DGEList(counts=exprSet, group=group)
+y <- calcNormFactors(y)
+design <- model.matrix(~group)
+y <- estimateDisp(y, design)
+### To perform quasi-likelihood F-tests (overall)
+fit <- glmQLFit(y, design)
+qlf <- glmQLFTest(fit, coef=2)
+res <- topTags(qlf,n=nrow(exprSet))
+res <- res@.Data[[1]]
+### to perform paired case study
+rm(list=ls())
+setwd('C:\\Users\\11780\\Documents\\RÓïÑÔÁ·Ï°\\TCGA\\PRAD\\RNA_Seq')
+load('PRAD_clinical.Rdata')
+load('PRAD_exprSet.Rdata')
+load('PRAD_mutation.Rdata')
+load('paired_info.Rdata')
+paired_info$group=NA
+paired_info$group[which(paired_info$type=='case')]='1'
+paired_info$group[which(paired_info$type=='control')] = '0'
+exprSet=exprSet[,which(colnames(exprSet) %in% paired_info$tissue_id)]
+exprSet=exprSet[, sort(colnames(exprSet))]
+
+symbol=rownames(exprSet)
+k=keys(org.Hs.eg.db,keytype = "SYMBOL")
+list=AnnotationDbi::select(org.Hs.eg.db,keys=k,columns = 'ENTREZID', keytype="SYMBOL")
+symbol <- list[match(symbol,list[,"SYMBOL"]),]
+exprSet <- cbind(exprSet, symbol)
+y <- DGEList(counts=exprSet[,1:(ncol(exprSet)-2)], genes=exprSet[,(ncol(exprSet)-1):ncol(exprSet)])
+##o <- order(rowSums(y$counts), decreasing=TRUE)
+##y <- y[o,] 
+d <- duplicated(y$genes$SYMBOL) 
+y <- y[!d,] ### some genes have been removed
+keep <- rowSums(cpm(y)>1) >= 2 
+y <- y[keep, , keep.lib.sizes=FALSE]
+y$samples$lib.size <- colSums(y$counts)
+##rownames(y$counts) <- y$genes$ENTREZID
+##rownames(y$genes) <- y$genes$ENTREZID ## a problem
+y <- calcNormFactors(y)
+## y$samples
+## plotMDS(y)
+## Patient <- factor(c(paired_info$bcr_patient_barcode)) 
+## Tissue <- factor(c(paired_info$type))
+## data.frame(Sample=paired_info$tissue_id,Patient,Tissue)
+## design <- model.matrix(~0+Patient+Tissue) 
+## rownames(design) <- paired_info$tissue_id
+design <- model.matrix(~0+factor(bcr_patient_barcode)+factor(group), data=paired_info)
+y <- estimateDisp(y, design, robust=TRUE) 
+y$common.dispersion ## the square rooot of the common dispersion is the coefficient of biological variation (CV)
+## plotBCV(y) ## to view the plot of biological coefficient of variation 
+fit <- glmFit(y, design) ## to fit genewise glms
+lrt <- glmLRT(fit)  ## to conduct likelihood ratio tests for tumour vs normal tissue differences
+topTags(lrt)
+res1 <- topTags(lrt, n=nrow(y$counts))
+res1 <- res1@.Data[[1]]
+summary(decideTests(lrt))
+plotMD(lrt)
+abline(h=c(-1, 1), col="blue")
+
+## quasi-likelihood
+fit2 <- glmQLFit(y,design) 
+qlf <- glmQLFTest(fit2)
+res2 <- topTags(qlf,n=nrow(y$counts))
+res2 <- res2@.Data[[1]]
+summary(decideTests(qlf))
+plotMD(lrt)
+abline(h=c(-1, 1), col="blue")
+
+
+## using DESeq2 analysis
+
+paired_info$age_group=NA
+paired_info$age_group[which(paired_info$age >= 70)] <- 'older'
+paired_info$age_group[which(paired_info$age>=60 & paired_info$age < 70)] <- 'old'
+paired_info$age_group[which(paired_info$age >= 50 & paired_info$age < 60)] <- 'below_old'
+paired_info$age_group[which(paired_info$age >=40 & paired_info$age < 50)] <- 'middle_age'
+paired_info$age_group[which(paired_info$age<40)] <- 'below_middle'
+paired_info$age=factor(paired_info$age_group)
+paired_info$group=factor(paired_info$group)
+paired_info$bcr_patient_barcode=factor(paired_info$bcr_patient_barcode)
+dds = DESeqDataSetFromMatrix(countData = exprSet[,1:(ncol(exprSet)-2)], colData=paired_info, design=~0+bcr_patient_barcode+group)
+keep <- rowSums(counts(dds)) >= 1000
+dds <- dds[keep,]
+dds=DESeq(dds)
+res = results(dds, contrast=c('group','1','0'), alpha=0.05) ## contrast used to extract comparison and alpha is the FDR cutoff value
+res = res[order(res$pvalue),]
+summary(res)
+myFPM = as.matrix(fpm(dds))
+{	### make vacano plot, highlight genes using self-defined criteria
+	gene=res@rownames
+	data=as.data.frame(res@listData)
+	rownames(data) <- gene
+	data$change = as.factor(ifelse(data$padj < 0.05 & abs(data$log2FoldChange) > 1, 
+                             ifelse(data$log2FoldChange > 1, "UP", "DOWN"), "NOT"))
+	volcano_title <- paste0("Cutoff for logFC is 1","\nThe number of up genes is ", nrow(data[which(data$change == "UP"),]),
+					        "\nThe number of down gene is", nrow(data[which(data$change == "DOWN"),]))
+	volcano = ggplot(data=data, aes(x= log2FoldChange, y= -log10(pvalue), color=change))+
+                   geom_point(alpha = 0.4, size=2.5) +
+				   theme_set(theme_set(theme_bw(base_size = 15)))+
+				   xlab("log2 fold change")+ylab("-log10 p-value")+
+				   ggtitle(volcano_title)+theme(plot.title = element_text(size=15, hjust=0.5))+
+				   scale_colour_manual(values=c("blue","black", "red"))+
+				   geom_vline(xintercept=c(-1,1),colour="#990000", linetype="dashed")
+	print(volcano)
+	}
+sigdata=data[which(data$change %in% c('UP','DOWN')),]
+## make MA plot
+pdf('maplot-sex-bmi-age-batch.pdf')
+plotMA(res, ylim=c(-2,2))
+dev.off()
+
+
+## use clusterProfiler to do pathway and enrichment analysis
+setwd('C:\\Users\\11780\\Documents\\RÓïÑÔÁ·Ï°\\TCGA\\PRAD\\RNA_Seq')
+load('prad.rnaseq.res.Rdata')
+load('PRAD_clinical.Rdata')
+load('PRAD_exprSet.Rdata')
+load('PRAD_mutation.Rdata')
+res4 <- res[which(abs(res$logFC) > 2 & res$logCPM > 2 & res$FDR < 0.05),]
+gene <- rownames(res4)
+ids <- bitr(gene, fromType="SYMBOL", toType=c("ENTREZID", "ENSEMBL"), OrgDb="org.Hs.eg.db")
+geneid <- ids$ENTREZID
+reactome_rich <- enrichKEGG(gene=geneid, organism='hsa', pvalueCutoff=0.05)
+reactome_gse <- gsePathway(gene=gene, organism='hsa', pvalueCutoff=0.05)
+kk <- enrichKEGG(gene         = gene[,2],
+                 organism     = 'hsa',
+                 pvalueCutoff = 0.05)
+e <- enrichr(gene[,2],TERM2GENE=c5)
+ego <- enrichGO(gene          = gene[,2],
+                OrgDb         = org.Hs.eg.db,
+				keyType		  = 'ENTREZID',
+                ont           = "CC",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+                qvalueCutoff  = 0.05,
+        readable      = TRUE)
+barplot(kk, drop=TRUE, showCategory=12)
+
+## to seperate tumor group by TP53
+setwd('C:\\Users\\11780\\Documents\\RÓïÑÔÁ·Ï°\\TCGA\\PRAD\\RNA_Seq')
+load('PRAD_clinical.Rdata')
+load('PRAD_exprSet.Rdata')
+load('PRAD_mutation.Rdata')
+load('paired_info.Rdata')
+p53_sample <- dplyr::filter(PRAD_mutation, Hugo_Symbol=='TP53')
+p53_tumor_id <- dplyr::rename(dplyr::select(p53_sample, Tumor_Sample_Barcode), tissue_id=Tumor_Sample_Barcode)
+p53_normal_id <- dplyr::rename(dplyr::select(p53_sample, Matched_Norm_Sample_Barcode),tissue_id=Matched_Norm_Sample_Barcode)
+p53_id <- mutate(rbind(p53_tumor_id, p53_normal_id), id=gsub(pattern='-',replacement='_', substr(tissue_id, 1, 16)))
+p53_id <- dplyr::rename(dplyr::select(p53_id, id), tissue_id=id)
+p53_info <- merge(p53_id, merged_info, by='tissue_id')
+p53_info <- p53_info[!duplicated(p53_info),]
+p53_info <- p53_info[which(p53_info$type == 'case'),]
+p53_info$mutation = '1'
+p53_info <- dplyr::select(p53_info, tissue_id, mutation)
+case_id=case$tissue_id
+non_p53= case[!(case_id %in% p53_id$tissue_id),]
+non_p53$mutation='0'
+non_p53 <- dplyr::select(non_p53, tissue_id, mutation)
+compare_mutation <- rbind(p53_info, non_p53)
+compare_mutation <- merge(compare_mutation, merged_info, by='tissue_id')
+exprSet=exprSet[,which(colnames(exprSet) %in% compare_mutation$tissue_id)]
+exprSet=exprSet[, sort(colnames(exprSet))]
+symbol=rownames(exprSet)
+k=keys(org.Hs.eg.db,keytype = "SYMBOL")
+list=AnnotationDbi::select(org.Hs.eg.db,keys=k,columns = 'ENTREZID', keytype="SYMBOL")
+symbol <- list[match(symbol,list[,"SYMBOL"]),]
+exprSet <- cbind(exprSet, symbol)
+y <- DGEList(counts=exprSet[,1:(ncol(exprSet)-2)], genes=exprSet[,(ncol(exprSet)-1):ncol(exprSet)])
+d <- duplicated(y$genes$SYMBOL) 
+y <- y[!d,]
+keep <- rowSums(cpm(y)>1) >= 2 
+y <- y[keep, , keep.lib.sizes=FALSE]
+y$samples$lib.size <- colSums(y$counts)
+y <- calcNormFactors(y)
+design <- model.matrix(~0+factor(mutation), data=compare_mutation)
+y <- estimateDisp(y, design, robust=TRUE) 
+y$common.dispersion ## the square rooot of the common dispersion is the coefficient of biological variation (CV) 
+fit <- glmFit(y, design) ## to fit genewise glms
+lrt <- glmLRT(fit,coef=2)  ## to conduct likelihood ratio tests for tumour vs normal tissue differences
+topTags(lrt)
+res <- topTags(lrt, n=nrow(y$counts))
+res <- res@.Data[[1]]
+
+
+## use GenVisR
+rm(list=ls())
+setwd('C:\\Users\\11780\\Documents\\RÓïÑÔÁ·Ï°\\TCGA\\PRAD\\RNA_Seq')
+load('PRAD_clinical.Rdata')
+PRAD_mutation=read.csv(file='PRAD_mutation.maf', header = TRUE, sep = '\t', stringsAsFactors = FALSE, comment.char = "#")
+
+library('GenVisR')
+library('BSgenome.Hsapiens.UCSC.hg19')
+tp53 <-PRAD_mutation[which(PRAD_mutation$Hugo_Symbol=='TP53'),]
+data <- tp53[, c("Hugo_Symbol", "HGVSp_Short")]
+data <- as.data.frame(cbind(data, "ENST00000269305"))
+colnames(data) <- c("gene", "amino_acid_change", "transcript_name")
+data$impact <- sample(c("Low", "Medium", "High"), 41, replace = TRUE)
+
+pdf('protein_pos.pdf',width=15, height=10)
+lolliplot(data,fillCol='impact',labelCol='amino_acid_change')
+dev.off()
+
+pdf('mutation.pdf')
+waterfall(tp53,fileType='MAF',mainRecurCutoff = 0.05, mainLabelCol='SIFT',mainLabelAngle = 90,
+			mainGrid=T,mainDropMut=T, mainLabelSize = 3)
+dev.off()
+assembly <- getHeader(tp53)
+assembly <- assembly[grepl("assembly", assembly$Info), ]
+drawPlot(MutSpectra(tp53, BSgenome = BSgenome.Hsapiens.UCSC.hg19))
+data <- tp53[, c("Hugo_Symbol", "Amino_acids")]
+data <- as.data.frame(cbind(data, "ENST00000269305"))
+colnames(data) <- c("gene", "amino_acid_change", "transcript_name")
+
+# Call lolliplot
+lolliplot(data)
+
+pdf('allele_trans.pdf')
+TvTi(tp53, type = "Frequency", palette = c("#77C55D", "#A461B4", "#C1524B", 
+    "#93B5BB", "#4F433F", "#BFA753"), lab_txtAngle = 75, fileType = "MAF")
+dev.off()
+
+pdf('allele_trans2.pdf')
+TvTi(tp53, lab_txtAngle=75, fileType="MAF")
+dev.off()
+
+samples_to_plot <- c("TCGA-A1-A0SO-01A-22D-A099-09", "TCGA-A2-A0EU-01A-22W-A071-09", "TCGA-A2-A0ER-01A-21W-A050-09", "TCGA-A1-A0SI-01A-11D-A142-09", "TCGA-A2-A0D0-01A-11W-A019-09")
+waterfall(brcaMAF_sub, plotSamples = samples_to_plot, mainRecurCutoff = 0.25)
+# Create clinical data
+subtype <- c("lumA", "lumB", "her2", "basal", "normal")
+subtype <- sample(subtype, 50, replace = TRUE)
+age <- c("20-30", "31-50", "51-60", "61+")
+age <- sample(age, 50, replace = TRUE)
+sample <- as.character(unique(brcaMAF$Tumor_Sample_Barcode))
+clinical <- as.data.frame(cbind(sample, subtype, age))
+
+
+6401 SELE selectin E
+5578 PRKCA protein kinase C alpha
+7412 VCAM1 vascular cell adhesion molecule 1
+356 FASLG Fas ligand 
